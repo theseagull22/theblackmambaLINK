@@ -1,0 +1,992 @@
+//@version=6
+indicator("LINK AO 20m Swing Engine v2 trigger-flex", overlay = true, max_labels_count = 500, max_lines_count = 500)
+
+// =========================
+// Inputs
+// =========================
+groupCore = "Core rules"
+impulseMinBars      = input.int(3, "Min bars in pre-trigger impulse series", minval = 1, group = groupCore)
+triggerBars         = input.int(5, "Bars in trigger reversal sequence", minval = 1, group = groupCore)
+firstGreenMin       = input.float(-0.11, "Long: first green AO bar must be below", step = 0.001, group = groupCore)
+firstRedMax         = input.float(0.063, "Short: first red AO bar must be above", step = 0.001, group = groupCore)
+entryOffset         = input.float(0.03, "Entry offset from swing", step = 0.001, group = groupCore)
+stopOffset          = input.float(0.016, "Stop offset from swing", step = 0.001, group = groupCore)
+tpDistance          = input.float(0.09, "TP distance from calculated entry", step = 0.001, group = groupCore)
+beTrigger           = input.float(0.069, "Move stop to BE+ after move", step = 0.001, group = groupCore)
+beOffset            = input.float(0.04, "BE offset from actual fill", step = 0.001, group = groupCore)
+pendingLifeHours    = input.int(6, "Pending order life (hours)", minval = 1, group = groupCore)
+orderLifeBars       = math.max(1, int(math.round(pendingLifeHours * 3.0)))
+
+groupEngine = "Engine / safety"
+maxImpulseScan      = input.int(40, "Max AO bars to scan for impulse series", minval = 8, group = groupEngine)
+maxSwingScan        = input.int(500, "Max bars to scan for swing between triggers", minval = 20, group = groupEngine)
+stopFirstOnBothHit  = input.bool(true, "If stop and TP hit same bar -> stop first", group = groupEngine)
+
+groupMoney = "Money / fees"
+positionQtyLINK     = input.float(122.0, "Position size (LINK)", minval = 0.01, step = 0.01, group = groupMoney)
+initialCapitalUSDT  = input.float(1000.0, "Initial capital (USDT)", minval = 0.01, step = 1.0, group = groupMoney)
+feesEnabled         = input.bool(true, "Enable fees", group = groupMoney)
+feePerSidePct       = input.float(0.02, "Fee per side (%)", minval = 0.0, step = 0.001, group = groupMoney)
+
+groupViz = "Visuals"
+showSignalLabels    = input.bool(true, "Show signal labels", group = groupViz)
+showEntryExitLabels = input.bool(true, "Show entry/exit labels", group = groupViz)
+showPendingLines    = input.bool(true, "Show nearest pending entry lines", group = groupViz)
+showStatsTable      = input.bool(true, "Show stats table", group = groupViz)
+
+groupLive = "Live integration prep"
+liveMode             = input.bool(true, "Enable live prep mode", group = groupLive)
+emitAlertPayloads    = input.bool(true, "Emit webhook JSON via alert()", group = groupLive)
+execSymbol           = input.string("LINKUSDT", "Execution symbol", group = groupLive)
+engineTag            = input.string("link_ao_20m_v2_trigger_flex", "Engine tag", group = groupLive)
+showLiveTable        = input.bool(true, "Show live state in dashboard", group = groupLive)
+showEventDebug       = input.bool(true, "Show event debug in dashboard", group = groupLive)
+beMoveMode           = input.string("live_intrabar", "BE move mode", options = ["bar_close", "live_intrabar"], group = groupLive)
+
+// =========================
+// Timeframe guard
+// =========================
+bool tfOk = timeframe.period == "20"
+var bool tfWarned = false
+if not tfOk and not tfWarned and barstate.islast
+    label.new(x = bar_index, y = high, text = "This script is intended for 20m timeframe", style = label.style_label_down, color = color.red, textcolor = color.white)
+    tfWarned := true
+
+// =========================
+// Dataset window tracking
+// =========================
+var int firstLoadedTime = na
+if na(firstLoadedTime)
+    firstLoadedTime := time
+
+float testedDays = math.max((time - firstLoadedTime) / 86400000.0, 20.0 / 1440.0)
+int testedBars = bar_index + 1
+
+// =========================
+// AO
+// =========================
+float ao = ta.sma(hl2, 5) - ta.sma(hl2, 34)
+
+// =========================
+// Helpers
+// =========================
+f_fee_usdt(float price, float qty, bool enabled, float feePct) =>
+    enabled ? price * qty * feePct / 100.0 : 0.0
+
+f_count_pre_long_impulse(int triggerLen, int maxBars) =>
+    int c = 0
+    for i = triggerLen to maxBars
+        bool ok = not na(ao[i + 1]) and ao[i] < 0 and ao[i + 1] < 0 and ao[i] < ao[i + 1]
+        if ok
+            c += 1
+        else
+            break
+    c
+
+f_count_pre_short_impulse(int triggerLen, int maxBars) =>
+    int c = 0
+    for i = triggerLen to maxBars
+        bool ok = not na(ao[i + 1]) and ao[i] > 0 and ao[i + 1] > 0 and ao[i] > ao[i + 1]
+        if ok
+            c += 1
+        else
+            break
+    c
+
+f_long_reversal(int triggerLen) =>
+    bool ok = triggerLen >= 1 and not na(ao[triggerLen])
+    if ok
+        if triggerLen > 1
+            for i = 0 to triggerLen - 2
+                ok := ok and not na(ao[i + 1]) and ao[i] < 0 and ao[i + 1] < 0 and ao[i] > ao[i + 1]
+        ok := ok and ao[triggerLen - 1] < 0 and ao[triggerLen - 1] > ao[triggerLen]
+    ok
+
+f_short_reversal(int triggerLen) =>
+    bool ok = triggerLen >= 1 and not na(ao[triggerLen])
+    if ok
+        if triggerLen > 1
+            for i = 0 to triggerLen - 2
+                ok := ok and not na(ao[i + 1]) and ao[i] > 0 and ao[i + 1] > 0 and ao[i] < ao[i + 1]
+        ok := ok and ao[triggerLen - 1] > 0 and ao[triggerLen - 1] < ao[triggerLen]
+    ok
+
+f_swing_low(int barsBack, int cap) =>
+    int useBars = math.max(1, math.min(barsBack, cap))
+    float v = low
+    if useBars > 1
+        for i = 1 to cap - 1
+            if i < useBars and not na(low[i])
+                v := math.min(v, low[i])
+    v
+
+f_swing_high(int barsBack, int cap) =>
+    int useBars = math.max(1, math.min(barsBack, cap))
+    float v = high
+    if useBars > 1
+        for i = 1 to cap - 1
+            if i < useBars and not na(high[i])
+                v := math.max(v, high[i])
+    v
+
+f_remove_order(int idx, array<string> ids, array<int> dirs, array<float> entries, array<float> sls, array<float> tps, array<int> sigBars, array<int> expBars, array<int> stages) =>
+    array.remove(ids, idx)
+    array.remove(dirs, idx)
+    array.remove(entries, idx)
+    array.remove(sls, idx)
+    array.remove(tps, idx)
+    array.remove(sigBars, idx)
+    array.remove(expBars, idx)
+    array.remove(stages, idx)
+
+f_gap_fill_long(float entryPrice) =>
+    open <= entryPrice ? open : entryPrice
+
+f_gap_fill_short(float entryPrice) =>
+    open >= entryPrice ? open : entryPrice
+
+f_gap_exit_long_stop(float stopPrice) =>
+    open <= stopPrice ? open : stopPrice
+
+f_gap_exit_long_tp(float tpPrice) =>
+    open >= tpPrice ? open : tpPrice
+
+f_gap_exit_short_stop(float stopPrice) =>
+    open >= stopPrice ? open : stopPrice
+
+f_gap_exit_short_tp(float tpPrice) =>
+    open <= tpPrice ? open : tpPrice
+
+f_json_num(float v) =>
+    na(v) ? "null" : str.tostring(v, format.mintick)
+
+f_json_int(int v) =>
+    str.tostring(v)
+
+f_json_bool(bool v) =>
+    v ? "true" : "false"
+
+f_json_str_or_null(string v) =>
+    str.length(v) > 0 ? '"' + v + '"' : "null"
+
+f_stage_text(int stage) =>
+    stage == 1 ? "live" : "shadow"
+
+f_pos_state_text(bool active, int dir) =>
+    active ? (dir == 1 ? "long" : "short") : "flat"
+
+f_batch_id(int seq) =>
+    engineTag + ":" + str.tostring(time) + ":" + str.tostring(bar_index) + ":" + str.tostring(seq)
+
+f_build_event(string eventName, string orderId, int dir, float entryPrice, float stopPrice, float tpPrice, int expiryBar, int stage, string reason) =>
+    string out = "{" 
+    out += "\"event\":\"" + eventName + "\"," 
+    out += "\"engine\":\"" + engineTag + "\"," 
+    out += "\"symbol\":\"" + execSymbol + "\"," 
+    out += "\"tf\":\"" + timeframe.period + "\"," 
+    out += "\"bar_index\":" + str.tostring(bar_index) + "," 
+    out += "\"ts\":" + str.tostring(time) + "," 
+    out += "\"id\":\"" + orderId + "\"," 
+    out += "\"side\":\"" + (dir == 1 ? "long" : "short") + "\"," 
+    out += "\"entry\":" + f_json_num(entryPrice) + "," 
+    out += "\"sl\":" + f_json_num(stopPrice) + "," 
+    out += "\"tp\":" + f_json_num(tpPrice) + "," 
+    out += "\"expiry_bar\":" + f_json_int(expiryBar) + "," 
+    out += "\"stage\":\"" + f_stage_text(stage) + "\"," 
+    out += "\"reason\":\"" + reason + "\"}"
+    out
+
+f_flush_events(array<string> events, bool curPosActive, int curPosDir, string curPosId, float curPosFill, float curPosStop, float curPosTP, bool curPosMovedToBE, int curLivePendingCount, int curShadowPendingCount, int curPendingLongs, int curPendingShorts, int batchSeq) =>
+    string payload = ""
+    if array.size(events) > 0
+        string body = ""
+        int i = 0
+        while i < array.size(events)
+            string ev = array.get(events, i)
+            string evWrapped = "{"
+            evWrapped += "\"event_index\":" + str.tostring(i) + ","
+            evWrapped += str.substring(ev, 1, str.length(ev))
+            body += (i == 0 ? "" : ",") + evWrapped
+            i += 1
+        payload := "{"
+        payload += "\"schema_version\":\"1.2\"," 
+        payload += "\"batch_id\":\"" + f_batch_id(batchSeq) + "\"," 
+        payload += "\"engine\":\"" + engineTag + "\"," 
+        payload += "\"symbol\":\"" + execSymbol + "\"," 
+        payload += "\"tf\":\"" + timeframe.period + "\"," 
+        payload += "\"bar_index\":" + str.tostring(bar_index) + "," 
+        payload += "\"ts\":" + str.tostring(time) + "," 
+        payload += "\"live_mode\":" + f_json_bool(liveMode) + "," 
+        payload += "\"position_state\":\"" + f_pos_state_text(curPosActive, curPosDir) + "\"," 
+        payload += "\"position_id\":" + f_json_str_or_null(curPosId) + "," 
+        payload += "\"position_entry\":" + f_json_num(curPosFill) + "," 
+        payload += "\"position_stop\":" + f_json_num(curPosStop) + "," 
+        payload += "\"position_tp\":" + f_json_num(curPosTP) + "," 
+        payload += "\"position_moved_to_be\":" + f_json_bool(curPosMovedToBE) + "," 
+        payload += "\"live_pending_count\":" + str.tostring(curLivePendingCount) + "," 
+        payload += "\"shadow_pending_count\":" + str.tostring(curShadowPendingCount) + "," 
+        payload += "\"pending_longs\":" + str.tostring(curPendingLongs) + "," 
+        payload += "\"pending_shorts\":" + str.tostring(curPendingShorts) + "," 
+        payload += "\"events_count\":" + str.tostring(array.size(events)) + "," 
+        payload += "\"events\":[" + body + "]}"
+    payload
+
+// =========================
+// Signal logic
+// =========================
+bool longReversal = f_long_reversal(triggerBars)
+bool shortReversal = f_short_reversal(triggerBars)
+
+int preLongImpulseCount  = f_count_pre_long_impulse(triggerBars, maxImpulseScan)
+int preShortImpulseCount = f_count_pre_short_impulse(triggerBars, maxImpulseScan)
+
+bool longSignal =
+     tfOk and barstate.isconfirmed and
+     longReversal and
+     ao[triggerBars - 1] < firstGreenMin and
+     preLongImpulseCount >= impulseMinBars
+
+bool shortSignal =
+     tfOk and barstate.isconfirmed and
+     shortReversal and
+     ao[triggerBars - 1] > firstRedMax and
+     preShortImpulseCount >= impulseMinBars
+
+// =========================
+// Trigger memory
+// =========================
+var int lastValidTriggerBar = na
+var int orderSeq = 0
+
+// Pending orders
+var array<string> pendIds    = array.new_string()
+var array<int>    pendDir    = array.new_int()      // +1 long, -1 short
+var array<float>  pendEntry  = array.new_float()
+var array<float>  pendSL     = array.new_float()
+var array<float>  pendTP     = array.new_float()
+var array<int>    pendSigBar = array.new_int()
+var array<int>    pendExpiry = array.new_int()
+var array<int>    pendStage  = array.new_int()      // 1 live on exchange, 0 shadow only
+
+// Active virtual position
+var bool   posActive     = false
+var int    posDir        = 0
+var float  posFill       = na
+var float  posCalcEntry  = na
+var float  posStop       = na
+var float  posTP         = na
+var bool   posMovedToBE  = false
+var bool   posBEArmed    = false
+var int    posBEArmBar   = na
+var int    posEntryBar   = na
+var string posId         = ""
+var float  posEntryFee   = na
+
+// Stats
+var int   totalTrades        = 0
+var int   wins               = 0
+var int   losses             = 0
+var int   breakevens         = 0
+var int   tpCount            = 0
+var int   stopCount          = 0
+var int   beStopCount        = 0
+var int   reverseCloseCount  = 0
+var int   reverseOpenCount   = 0
+
+var float grossPoints        = 0.0      // raw price points per 1 LINK
+var float grossPnlUSDT       = 0.0      // before fees, with qty
+var float totalFeesUSDT      = 0.0
+var float netPnlUSDT         = 0.0      // after fees
+var float sumWinUSDT         = 0.0      // net positive trades
+var float sumLossAbsUSDT     = 0.0      // abs(net negative trades)
+
+var array<string> liveEvents = array.new_string()
+
+var string lastEventName = ""
+var string lastEventId = ""
+var string lastEventReason = ""
+var string lastEventStage = ""
+var int    upsertPendingCount = 0
+var int    cancelPendingCount = 0
+var int    shadowStoreCount = 0
+var int    shadowDropCount = 0
+var int    shadowActivateCount = 0
+var int    moveStopCount = 0
+var int    fillExpectedCount = 0
+var int    exitExpectedCount = 0
+var int    alertBatchCount = 0
+var int    alertEventCount = 0
+var int    lastAlertBar = na
+var int    lastAlertEventCount = 0
+
+varip int    webhookSeq = 0
+varip bool   posBELiveAlertSent = false
+varip int    posBELiveAlertBar = na
+varip bool   posBESuppressNextBarCloseAlert = false
+
+// =========================
+// Realtime BE move prep
+// =========================
+bool rtMoveStopReady = false
+float rtMoveStopPrice = na
+
+if tfOk and liveMode and emitAlertPayloads and beMoveMode == "live_intrabar" and barstate.isrealtime and not barstate.isconfirmed and posActive and not posMovedToBE and not posBELiveAlertSent and not posBESuppressNextBarCloseAlert
+    bool rtBEHit = posDir == 1 ? high >= posFill + beTrigger : low <= posFill - beTrigger
+    if rtBEHit
+        rtMoveStopPrice := posDir == 1 ? math.max(posStop, posFill + beOffset) : math.min(posStop, posFill - beOffset)
+        posBELiveAlertSent := true
+        posBELiveAlertBar := bar_index
+        posBESuppressNextBarCloseAlert := true
+        lastEventName := "move_stop"
+        lastEventId := posId
+        lastEventReason := "be_activated"
+        lastEventStage := "live"
+        moveStopCount += 1
+        rtMoveStopReady := true
+
+// =========================
+// Core bar-close engine
+// =========================
+if barstate.isconfirmed and tfOk
+    array.clear(liveEvents)
+
+    // 1) Expire old pending orders
+    int expIdx = array.size(pendIds) - 1
+    while expIdx >= 0
+        if bar_index > array.get(pendExpiry, expIdx)
+            string expiredId = array.get(pendIds, expIdx)
+            int expiredDir = array.get(pendDir, expIdx)
+            float expiredEntry = array.get(pendEntry, expIdx)
+            float expiredSL = array.get(pendSL, expIdx)
+            float expiredTP = array.get(pendTP, expIdx)
+            int expiredBar = array.get(pendExpiry, expIdx)
+            int expiredStage = array.get(pendStage, expIdx)
+
+            if liveMode
+                string ev = f_build_event(expiredStage == 1 ? "cancel_pending" : "shadow_drop", expiredId, expiredDir, expiredEntry, expiredSL, expiredTP, expiredBar, expiredStage, "ttl_expired")
+                array.push(liveEvents, ev)
+                lastEventName := expiredStage == 1 ? "cancel_pending" : "shadow_drop"
+                lastEventId := expiredId
+                lastEventReason := "ttl_expired"
+                lastEventStage := f_stage_text(expiredStage)
+                if expiredStage == 1
+                    cancelPendingCount += 1
+                else
+                    shadowDropCount += 1
+
+            f_remove_order(expIdx, pendIds, pendDir, pendEntry, pendSL, pendTP, pendSigBar, pendExpiry, pendStage)
+        expIdx -= 1
+
+    // 1.5) If flat in live mode, activate any surviving shadow pending
+    if liveMode and not posActive and array.size(pendIds) > 0
+        int stageIdx = 0
+        while stageIdx < array.size(pendIds)
+            if array.get(pendStage, stageIdx) == 0
+                array.set(pendStage, stageIdx, 1)
+                string ev = f_build_event("upsert_pending", array.get(pendIds, stageIdx), array.get(pendDir, stageIdx), array.get(pendEntry, stageIdx), array.get(pendSL, stageIdx), array.get(pendTP, stageIdx), array.get(pendExpiry, stageIdx), 1, "shadow_activated_after_flat")
+                array.push(liveEvents, ev)
+                lastEventName := "upsert_pending"
+                lastEventId := array.get(pendIds, stageIdx)
+                lastEventReason := "shadow_activated_after_flat"
+                lastEventStage := "live"
+                upsertPendingCount += 1
+                shadowActivateCount += 1
+            stageIdx += 1
+
+    // 2) Register new valid trigger -> create pending order
+    if longSignal or shortSignal
+        int barsSincePrevTrigger = na(lastValidTriggerBar) ? (bar_index + 1) : (bar_index - lastValidTriggerBar + 1)
+        float swing = na
+        float calcEntry = na
+        float calcSL = na
+        float calcTP = na
+        int dir = longSignal ? 1 : -1
+
+        if longSignal
+            swing     := f_swing_low(barsSincePrevTrigger, maxSwingScan)
+            calcEntry := swing + entryOffset
+            calcSL    := swing - stopOffset
+            calcTP    := calcEntry + tpDistance
+        else
+            swing     := f_swing_high(barsSincePrevTrigger, maxSwingScan)
+            calcEntry := swing - entryOffset
+            calcSL    := swing + stopOffset
+            calcTP    := calcEntry - tpDistance
+
+        orderSeq += 1
+        string newId = (dir == 1 ? "L-" : "S-") + str.tostring(orderSeq)
+
+        array.push(pendIds, newId)
+        array.push(pendDir, dir)
+        array.push(pendEntry, calcEntry)
+        array.push(pendSL, calcSL)
+        array.push(pendTP, calcTP)
+        array.push(pendSigBar, bar_index)
+        array.push(pendExpiry, bar_index + orderLifeBars)
+        int newStage = liveMode and posActive ? 0 : 1
+        array.push(pendStage, newStage)
+
+        if liveMode
+            string evName = newStage == 1 ? "upsert_pending" : "shadow_store"
+            string evReason = newStage == 1 ? "new_signal_flat" : "new_signal_while_in_position"
+            string ev = f_build_event(evName, newId, dir, calcEntry, calcSL, calcTP, bar_index + orderLifeBars, newStage, evReason)
+            array.push(liveEvents, ev)
+            lastEventName := evName
+            lastEventId := newId
+            lastEventReason := evReason
+            lastEventStage := f_stage_text(newStage)
+            if newStage == 1
+                upsertPendingCount += 1
+            else
+                shadowStoreCount += 1
+
+        if showSignalLabels
+            label.new(
+                 x = bar_index,
+                 y = dir == 1 ? low : high,
+                 text = (dir == 1 ? "LONG sig\n" : "SHORT sig\n") +
+                        "swing=" + str.tostring(swing, format.mintick) + "\n" +
+                        "entry=" + str.tostring(calcEntry, format.mintick) + "\n" +
+                        "SL=" + str.tostring(calcSL, format.mintick) + "\n" +
+                        "TP=" + str.tostring(calcTP, format.mintick),
+                 style = dir == 1 ? label.style_label_up : label.style_label_down,
+                 color = dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0),
+                 textcolor = color.white,
+                 size = size.small)
+
+        lastValidTriggerBar := bar_index
+
+    // 3) If there is active position, handle BE arm/activation first
+    if posActive
+        bool beTriggerHitNow = posDir == 1 ? high >= posFill + beTrigger : low <= posFill - beTrigger
+
+        if beMoveMode == "live_intrabar" and posBELiveAlertSent and posBELiveAlertBar == bar_index
+            posBEArmed := true
+            posBEArmBar := bar_index
+            posBELiveAlertSent := false
+            posBELiveAlertBar := na
+        else
+            if not posMovedToBE and not posBEArmed and beTriggerHitNow
+                posBEArmed := true
+                posBEArmBar := bar_index
+
+            if posBEArmed and bar_index > posBEArmBar
+                if posDir == 1
+                    posStop := math.max(posStop, posFill + beOffset)
+                else
+                    posStop := math.min(posStop, posFill - beOffset)
+                if liveMode and not posBESuppressNextBarCloseAlert
+                    string ev = f_build_event("move_stop", posId, posDir, posFill, posStop, posTP, na(posEntryBar) ? bar_index : posEntryBar, 1, "be_activated")
+                    array.push(liveEvents, ev)
+                    lastEventName := "move_stop"
+                    lastEventId := posId
+                    lastEventReason := "be_activated"
+                    lastEventStage := "live"
+                    moveStopCount += 1
+                posMovedToBE := true
+                posBEArmed := false
+                posBEArmBar := na
+                posBELiveAlertSent := false
+                posBELiveAlertBar := na
+                posBESuppressNextBarCloseAlert := false
+
+    // 4) Auto-reverse if opposite pending entry is touched while a position is active
+    if not liveMode and posActive and array.size(pendIds) > 0
+        int oppIdx = na
+        float oppFillPx = na
+
+        int scanIdx = 0
+        while scanIdx < array.size(pendIds) and na(oppIdx)
+            int d = array.get(pendDir, scanIdx)
+            float ep = array.get(pendEntry, scanIdx)
+            int sigBar = array.get(pendSigBar, scanIdx)
+
+            if d != posDir and bar_index > sigBar
+                if d == 1
+                    if open <= ep
+                        oppIdx := scanIdx
+                        oppFillPx := f_gap_fill_long(ep)
+                    else if low <= ep
+                        oppIdx := scanIdx
+                        oppFillPx := ep
+                else
+                    if open >= ep
+                        oppIdx := scanIdx
+                        oppFillPx := f_gap_fill_short(ep)
+                    else if high >= ep
+                        oppIdx := scanIdx
+                        oppFillPx := ep
+            scanIdx += 1
+
+        if not na(oppIdx)
+            // Close current position at reverse fill price
+            float reverseExitPx = oppFillPx
+            float oldGrossPoints = posDir == 1 ? (reverseExitPx - posFill) : (posFill - reverseExitPx)
+            float oldGrossUSDT = oldGrossPoints * positionQtyLINK
+            float oldExitFee = f_fee_usdt(reverseExitPx, positionQtyLINK, feesEnabled, feePerSidePct)
+            float oldTradeFees = nz(posEntryFee) + oldExitFee
+            float oldNetUSDT = oldGrossUSDT - oldTradeFees
+
+            totalTrades += 1
+            reverseCloseCount += 1
+
+            grossPoints += oldGrossPoints
+            grossPnlUSDT += oldGrossUSDT
+            totalFeesUSDT += oldTradeFees
+            netPnlUSDT += oldNetUSDT
+
+            if oldNetUSDT > 0
+                wins += 1
+                sumWinUSDT += oldNetUSDT
+            else if oldNetUSDT < 0
+                losses += 1
+                sumLossAbsUSDT += math.abs(oldNetUSDT)
+            else
+                breakevens += 1
+
+            if showEntryExitLabels
+                label.new(
+                     x = bar_index,
+                     y = reverseExitPx,
+                     text = "REVERSE close\n" +
+                            "id=" + posId + "\n" +
+                            "exit=" + str.tostring(reverseExitPx, format.mintick) + "\n" +
+                            "gross=" + str.tostring(oldGrossUSDT, "#.##") + "\n" +
+                            "fees=" + str.tostring(oldTradeFees, "#.##") + "\n" +
+                            "net=" + str.tostring(oldNetUSDT, "#.##"),
+                     style = posDir == 1 ? label.style_label_down : label.style_label_up,
+                     color = oldNetUSDT >= 0 ? color.new(color.green, 0) : color.new(color.red, 0),
+                     textcolor = color.white,
+                     size = size.small)
+
+            // Open opposite position from touched pending order at the same price
+            string newPosId   = array.get(pendIds, oppIdx)
+            int newPosDir     = array.get(pendDir, oppIdx)
+            float newCalcEnt  = array.get(pendEntry, oppIdx)
+            float newPosSL    = array.get(pendSL, oppIdx)
+            float newPosTP    = array.get(pendTP, oppIdx)
+
+            posActive    := true
+            posDir       := newPosDir
+            posFill      := oppFillPx
+            posCalcEntry := newCalcEnt
+            posStop      := newPosSL
+            posTP        := newPosTP
+            posMovedToBE := false
+            posBEArmed   := false
+            posBEArmBar  := na
+            posEntryBar  := bar_index
+            posId        := newPosId
+            posEntryFee  := f_fee_usdt(oppFillPx, positionQtyLINK, feesEnabled, feePerSidePct)
+            posBELiveAlertSent := false
+            posBELiveAlertBar := na
+            posBESuppressNextBarCloseAlert := false
+
+            reverseOpenCount += 1
+
+            if showEntryExitLabels
+                label.new(
+                     x = bar_index,
+                     y = oppFillPx,
+                     text = (newPosDir == 1 ? "LONG reverse fill\n" : "SHORT reverse fill\n") +
+                            "id=" + posId + "\n" +
+                            "calc=" + str.tostring(posCalcEntry, format.mintick) + "\n" +
+                            "fill=" + str.tostring(posFill, format.mintick) + "\n" +
+                            "entryFee=" + str.tostring(posEntryFee, "#.##"),
+                     style = newPosDir == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.blue, 0),
+                     textcolor = color.white,
+                     size = size.small)
+
+            f_remove_order(oppIdx, pendIds, pendDir, pendEntry, pendSL, pendTP, pendSigBar, pendExpiry, pendStage)
+
+    // 5) If flat, oldest touched pending order can fill
+    if not posActive and array.size(pendIds) > 0
+        int fillIdx = na
+        float fillPx = na
+
+        int scanFillIdx = 0
+        while scanFillIdx < array.size(pendIds) and na(fillIdx)
+            int d = array.get(pendDir, scanFillIdx)
+            float ep = array.get(pendEntry, scanFillIdx)
+            int sigBar = array.get(pendSigBar, scanFillIdx)
+
+            if bar_index > sigBar
+                if d == 1
+                    if open <= ep
+                        fillIdx := scanFillIdx
+                        fillPx := f_gap_fill_long(ep)
+                    else if low <= ep
+                        fillIdx := scanFillIdx
+                        fillPx := ep
+                else
+                    if open >= ep
+                        fillIdx := scanFillIdx
+                        fillPx := f_gap_fill_short(ep)
+                    else if high >= ep
+                        fillIdx := scanFillIdx
+                        fillPx := ep
+            scanFillIdx += 1
+
+        if not na(fillIdx)
+            int dir = array.get(pendDir, fillIdx)
+            float entryPx = array.get(pendEntry, fillIdx)
+
+            if liveMode and array.size(pendIds) > 0
+                int shadowIdx = 0
+                while shadowIdx < array.size(pendIds)
+                    if shadowIdx != fillIdx and array.get(pendStage, shadowIdx) == 1
+                        array.set(pendStage, shadowIdx, 0)
+                        string ev = f_build_event("cancel_pending", array.get(pendIds, shadowIdx), array.get(pendDir, shadowIdx), array.get(pendEntry, shadowIdx), array.get(pendSL, shadowIdx), array.get(pendTP, shadowIdx), array.get(pendExpiry, shadowIdx), 0, "filled_other_order_hold_shadow")
+                        array.push(liveEvents, ev)
+                        lastEventName := "cancel_pending"
+                        lastEventId := array.get(pendIds, shadowIdx)
+                        lastEventReason := "filled_other_order_hold_shadow"
+                        lastEventStage := "shadow"
+                        cancelPendingCount += 1
+                    shadowIdx += 1
+
+            posActive    := true
+            posDir       := dir
+            posFill      := fillPx
+            posCalcEntry := entryPx
+            posStop      := array.get(pendSL, fillIdx)
+            posTP        := array.get(pendTP, fillIdx)
+            posMovedToBE := false
+            posBEArmed   := false
+            posBEArmBar  := na
+            posEntryBar  := bar_index
+            posId        := array.get(pendIds, fillIdx)
+            posEntryFee  := f_fee_usdt(fillPx, positionQtyLINK, feesEnabled, feePerSidePct)
+            posBELiveAlertSent := false
+            posBELiveAlertBar := na
+            posBESuppressNextBarCloseAlert := false
+
+            if liveMode
+                string ev = f_build_event("entry_fill_expected", posId, posDir, posFill, posStop, posTP, bar_index, 1, "virtual_engine_fill_reference")
+                array.push(liveEvents, ev)
+                lastEventName := "entry_fill_expected"
+                lastEventId := posId
+                lastEventReason := "virtual_engine_fill_reference"
+                lastEventStage := "live"
+                fillExpectedCount += 1
+
+            if showEntryExitLabels
+                label.new(
+                     x = bar_index,
+                     y = fillPx,
+                     text = (dir == 1 ? "LONG fill\n" : "SHORT fill\n") +
+                            "id=" + posId + "\n" +
+                            "calc=" + str.tostring(posCalcEntry, format.mintick) + "\n" +
+                            "fill=" + str.tostring(posFill, format.mintick) + "\n" +
+                            "entryFee=" + str.tostring(posEntryFee, "#.##"),
+                     style = dir == 1 ? label.style_label_up : label.style_label_down,
+                     color = color.new(color.blue, 0),
+                     textcolor = color.white,
+                     size = size.small)
+
+            f_remove_order(fillIdx, pendIds, pendDir, pendEntry, pendSL, pendTP, pendSigBar, pendExpiry, pendStage)
+
+    // 6) Manage active position stop/tp after fills/reversals
+    if posActive and (not liveMode or na(posEntryBar) or bar_index > posEntryBar)
+        bool stopHit = posDir == 1 ? low <= posStop : high >= posStop
+        bool tpHit   = posDir == 1 ? high >= posTP   : low <= posTP
+
+        bool exitNow = false
+        float exitPx = na
+        string exitReason = ""
+
+        if stopHit and tpHit
+            if stopFirstOnBothHit
+                exitNow := true
+                exitReason := "STOP (both hit)"
+                exitPx := posDir == 1 ? f_gap_exit_long_stop(posStop) : f_gap_exit_short_stop(posStop)
+            else
+                exitNow := true
+                exitReason := "TP (both hit)"
+                exitPx := posDir == 1 ? f_gap_exit_long_tp(posTP) : f_gap_exit_short_tp(posTP)
+        else if stopHit
+            exitNow := true
+            exitReason := "STOP"
+            exitPx := posDir == 1 ? f_gap_exit_long_stop(posStop) : f_gap_exit_short_stop(posStop)
+        else if tpHit
+            exitNow := true
+            exitReason := "TP"
+            exitPx := posDir == 1 ? f_gap_exit_long_tp(posTP) : f_gap_exit_short_tp(posTP)
+
+        if exitNow
+            if liveMode
+                string ev = f_build_event("position_exit_expected", posId, posDir, posFill, posStop, posTP, bar_index, 1, exitReason)
+                array.push(liveEvents, ev)
+                lastEventName := "position_exit_expected"
+                lastEventId := posId
+                lastEventReason := exitReason
+                lastEventStage := "live"
+                exitExpectedCount += 1
+            float tradeGrossPoints = posDir == 1 ? (exitPx - posFill) : (posFill - exitPx)
+            float tradeGrossUSDT = tradeGrossPoints * positionQtyLINK
+            float tradeExitFee = f_fee_usdt(exitPx, positionQtyLINK, feesEnabled, feePerSidePct)
+            float tradeFees = nz(posEntryFee) + tradeExitFee
+            float tradeNetUSDT = tradeGrossUSDT - tradeFees
+
+            totalTrades += 1
+            grossPoints += tradeGrossPoints
+            grossPnlUSDT += tradeGrossUSDT
+            totalFeesUSDT += tradeFees
+            netPnlUSDT += tradeNetUSDT
+
+            if exitReason == "TP" or exitReason == "TP (both hit)"
+                tpCount += 1
+            else
+                stopCount += 1
+                if posMovedToBE
+                    beStopCount += 1
+
+            if tradeNetUSDT > 0
+                wins += 1
+                sumWinUSDT += tradeNetUSDT
+            else if tradeNetUSDT < 0
+                losses += 1
+                sumLossAbsUSDT += math.abs(tradeNetUSDT)
+            else
+                breakevens += 1
+
+            if showEntryExitLabels
+                label.new(
+                     x = bar_index,
+                     y = exitPx,
+                     text = exitReason + "\n" +
+                            "id=" + posId + "\n" +
+                            "exit=" + str.tostring(exitPx, format.mintick) + "\n" +
+                            "gross=" + str.tostring(tradeGrossUSDT, "#.##") + "\n" +
+                            "fees=" + str.tostring(tradeFees, "#.##") + "\n" +
+                            "net=" + str.tostring(tradeNetUSDT, "#.##"),
+                     style = posDir == 1 ? label.style_label_down : label.style_label_up,
+                     color = tradeNetUSDT >= 0 ? color.new(color.green, 0) : color.new(color.red, 0),
+                     textcolor = color.white,
+                     size = size.small)
+
+            posActive    := false
+            posDir       := 0
+            posFill      := na
+            posCalcEntry := na
+            posStop      := na
+            posTP        := na
+            posMovedToBE := false
+            posBEArmed   := false
+            posBEArmBar  := na
+            posEntryBar  := na
+            posId        := ""
+            posEntryFee  := na
+            posBELiveAlertSent := false
+            posBELiveAlertBar := na
+            posBESuppressNextBarCloseAlert := false
+
+// =========================
+// Derived dashboard metrics
+// =========================
+float grossReturnPct = initialCapitalUSDT > 0 ? grossPnlUSDT / initialCapitalUSDT * 100.0 : na
+float netReturnPct   = initialCapitalUSDT > 0 ? netPnlUSDT / initialCapitalUSDT * 100.0 : na
+float expectancyUSDT = totalTrades > 0 ? netPnlUSDT / totalTrades : na
+float avgWinUSDT     = wins > 0 ? sumWinUSDT / wins : na
+float avgLossUSDT    = losses > 0 ? sumLossAbsUSDT / losses : na
+float profitFactor   = sumLossAbsUSDT > 0 ? sumWinUSDT / sumLossAbsUSDT : na
+float winRate        = totalTrades > 0 ? wins * 100.0 / totalTrades : na
+
+float aprPct = na
+float returnRatio = initialCapitalUSDT > 0 ? netPnlUSDT / initialCapitalUSDT : na
+if initialCapitalUSDT > 0 and testedDays > 0 and not na(returnRatio) and (1.0 + returnRatio) > 0
+    aprPct := (math.pow(1.0 + returnRatio, 365.0 / testedDays) - 1.0) * 100.0
+
+int pendingLongs = 0
+int pendingShorts = 0
+int livePendingCount = 0
+int shadowPendingCount = 0
+int eventsThisBar = array.size(liveEvents)
+string lastEventLabel = str.length(lastEventName) > 0 ? lastEventName : "none"
+string lastEventIdLabel = str.length(lastEventId) > 0 ? lastEventId : "-"
+string lastEventReasonLabel = str.length(lastEventReason) > 0 ? lastEventReason : "-"
+string lastEventStageLabel = str.length(lastEventStage) > 0 ? lastEventStage : "-"
+if array.size(pendIds) > 0
+    int cIdx = 0
+    while cIdx < array.size(pendIds)
+        if array.get(pendDir, cIdx) == 1
+            pendingLongs += 1
+        else
+            pendingShorts += 1
+
+        if array.get(pendStage, cIdx) == 1
+            livePendingCount += 1
+        else
+            shadowPendingCount += 1
+        cIdx += 1
+
+// =========================
+// Visuals
+// =========================
+plotshape(longSignal,  title = "Long trigger",  style = shape.triangleup,   location = location.belowbar, color = color.new(color.green, 0), size = size.tiny, text = "L")
+plotshape(shortSignal, title = "Short trigger", style = shape.triangledown, location = location.abovebar, color = color.new(color.red, 0),   size = size.tiny, text = "S")
+
+plot(posActive ? posStop : na, "Active Stop", color = color.new(color.red, 0), linewidth = 2, style = plot.style_linebr)
+plot(posActive ? posTP   : na, "Active TP",   color = color.new(color.green, 0), linewidth = 2, style = plot.style_linebr)
+plot(posActive ? posFill : na, "Active Fill", color = color.new(color.blue, 0), linewidth = 1, style = plot.style_linebr)
+
+float nearestPendingLong = na
+float nearestPendingShort = na
+if array.size(pendIds) > 0
+    int pIdx = 0
+    while pIdx < array.size(pendIds)
+        int d = array.get(pendDir, pIdx)
+        float ep = array.get(pendEntry, pIdx)
+        if d == 1
+            nearestPendingLong := na(nearestPendingLong) ? ep : math.max(nearestPendingLong, ep)
+        else
+            nearestPendingShort := na(nearestPendingShort) ? ep : math.min(nearestPendingShort, ep)
+        pIdx += 1
+
+plot(showPendingLines ? nearestPendingLong : na, "Nearest pending long", color = color.new(color.green, 65), linewidth = 1, style = plot.style_linebr)
+plot(showPendingLines ? nearestPendingShort : na, "Nearest pending short", color = color.new(color.red, 65), linewidth = 1, style = plot.style_linebr)
+
+// Hidden AO plot for data window
+plot(ao, "AO", color = color.new(color.gray, 100), display = display.data_window)
+
+// =========================
+// Dashboard
+// =========================
+var table t = table.new(position.top_right, 2, 31, border_width = 1)
+
+if showStatsTable and barstate.islast
+    table.cell(t, 0, 0, "TF OK", text_color = color.white, bgcolor = tfOk ? color.new(color.green, 0) : color.new(color.red, 0))
+    table.cell(t, 1, 0, tfOk ? "20m" : "NO", text_color = color.white, bgcolor = tfOk ? color.new(color.green, 0) : color.new(color.red, 0))
+
+    table.cell(t, 0, 1, "Position", text_color = color.white, bgcolor = color.new(color.gray, 60))
+    table.cell(t, 1, 1, posActive ? (posDir == 1 ? "LONG" : "SHORT") : "FLAT", text_color = color.white, bgcolor = color.new(color.gray, 60))
+
+    table.cell(t, 0, 2, "Pending L/S", text_color = color.white, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 2, str.tostring(pendingLongs) + " / " + str.tostring(pendingShorts), text_color = color.white, bgcolor = color.new(color.gray, 80))
+
+    table.cell(t, 0, 3, "Live prep", text_color = color.white, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 3, showLiveTable ? (liveMode ? "ON" : "OFF") : "-", text_color = color.white, bgcolor = color.new(color.gray, 80))
+
+    table.cell(t, 0, 4, "Alerts", text_color = color.white, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 4, showLiveTable ? (emitAlertPayloads ? "ON" : "OFF") : "-", text_color = color.white, bgcolor = color.new(color.gray, 80))
+
+    table.cell(t, 0, 5, "Live / Shadow", text_color = color.white, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 5, showLiveTable ? (str.tostring(livePendingCount) + " / " + str.tostring(shadowPendingCount)) : "-", text_color = color.white, bgcolor = color.new(color.gray, 80))
+
+    table.cell(t, 0, 6, "Events this bar", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 6, showEventDebug ? str.tostring(eventsThisBar) : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 7, "Last event", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 7, showEventDebug ? lastEventLabel : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 8, "Last id", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 8, showEventDebug ? lastEventIdLabel : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 9, "Last reason", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 9, showEventDebug ? lastEventReasonLabel : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 10, "Last stage", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 10, showEventDebug ? lastEventStageLabel : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 11, "Evt U/C", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 11, showEventDebug ? (str.tostring(upsertPendingCount) + " / " + str.tostring(cancelPendingCount)) : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 12, "Evt SS/SD/SA", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 12, showEventDebug ? (str.tostring(shadowStoreCount) + " / " + str.tostring(shadowDropCount) + " / " + str.tostring(shadowActivateCount)) : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 13, "Evt MS/F/X", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 13, showEventDebug ? (str.tostring(moveStopCount) + " / " + str.tostring(fillExpectedCount) + " / " + str.tostring(exitExpectedCount)) : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 14, "Alert batches/events", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 14, showEventDebug ? (str.tostring(alertBatchCount) + " / " + str.tostring(alertEventCount)) : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 15, "Last alert bar", text_color = color.white, bgcolor = color.new(color.navy, 75))
+    table.cell(t, 1, 15, showEventDebug ? (na(lastAlertBar) ? "na" : str.tostring(lastAlertBar) + " (" + str.tostring(lastAlertEventCount) + ")") : "-", text_color = color.white, bgcolor = color.new(color.navy, 75))
+
+    table.cell(t, 0, 16, "Bars / Days", text_color = color.white, bgcolor = color.new(color.blue, 80))
+    table.cell(t, 1, 16, str.tostring(testedBars) + " / " + str.tostring(testedDays, "#.##"), text_color = color.white, bgcolor = color.new(color.blue, 80))
+
+    table.cell(t, 0, 17, "Trades", text_color = color.white, bgcolor = color.new(color.blue, 80))
+    table.cell(t, 1, 17, str.tostring(totalTrades), text_color = color.white, bgcolor = color.new(color.blue, 80))
+
+    table.cell(t, 0, 18, "Wins / Losses / BE", text_color = color.white, bgcolor = color.new(color.blue, 80))
+    table.cell(t, 1, 18, str.tostring(wins) + " / " + str.tostring(losses) + " / " + str.tostring(breakevens), text_color = color.white, bgcolor = color.new(color.blue, 80))
+
+    table.cell(t, 0, 19, "TP / STOP / BEstop", text_color = color.white, bgcolor = color.new(color.blue, 80))
+    table.cell(t, 1, 19, str.tostring(tpCount) + " / " + str.tostring(stopCount) + " / " + str.tostring(beStopCount), text_color = color.white, bgcolor = color.new(color.blue, 80))
+
+    table.cell(t, 0, 20, "Reverse close/open", text_color = color.white, bgcolor = color.new(color.blue, 80))
+    table.cell(t, 1, 20, str.tostring(reverseCloseCount) + " / " + str.tostring(reverseOpenCount), text_color = color.white, bgcolor = color.new(color.blue, 80))
+
+    table.cell(t, 0, 21, "Win rate %", text_color = color.white, bgcolor = color.new(color.blue, 80))
+    table.cell(t, 1, 21, na(winRate) ? "na" : str.tostring(winRate, "#.##"), text_color = color.white, bgcolor = color.new(color.blue, 80))
+
+    table.cell(t, 0, 22, "Gross points", text_color = color.white, bgcolor = color.new(color.green, 75))
+    table.cell(t, 1, 22, str.tostring(grossPoints, "#.##"), text_color = color.white, bgcolor = color.new(color.green, 75))
+
+    table.cell(t, 0, 23, "Gross USDT", text_color = color.white, bgcolor = color.new(color.green, 75))
+    table.cell(t, 1, 23, str.tostring(grossPnlUSDT, "#.##"), text_color = color.white, bgcolor = color.new(color.green, 75))
+
+    table.cell(t, 0, 24, "Fees USDT", text_color = color.white, bgcolor = color.new(color.orange, 70))
+    table.cell(t, 1, 24, str.tostring(totalFeesUSDT, "#.##"), text_color = color.white, bgcolor = color.new(color.orange, 70))
+
+    table.cell(t, 0, 25, "Net USDT", text_color = color.white, bgcolor = color.new(netPnlUSDT >= 0 ? color.green : color.red, 70))
+    table.cell(t, 1, 25, str.tostring(netPnlUSDT, "#.##"), text_color = color.white, bgcolor = color.new(netPnlUSDT >= 0 ? color.green : color.red, 70))
+
+    table.cell(t, 0, 26, "Return % / APR %", text_color = color.white, bgcolor = color.new(color.purple, 75))
+    table.cell(t, 1, 26, str.tostring(netReturnPct, "#.##") + " / " + (na(aprPct) ? "na" : str.tostring(aprPct, "#.##")), text_color = color.white, bgcolor = color.new(color.purple, 75))
+
+    table.cell(t, 0, 27, "Avg win / loss", text_color = color.white, bgcolor = color.new(color.teal, 75))
+    table.cell(t, 1, 27, (na(avgWinUSDT) ? "na" : str.tostring(avgWinUSDT, "#.##")) + " / " + (na(avgLossUSDT) ? "na" : str.tostring(avgLossUSDT, "#.##")), text_color = color.white, bgcolor = color.new(color.teal, 75))
+
+    table.cell(t, 0, 28, "Profit factor", text_color = color.white, bgcolor = color.new(color.teal, 75))
+    table.cell(t, 1, 28, na(profitFactor) ? "na" : str.tostring(profitFactor, "#.##"), text_color = color.white, bgcolor = color.new(color.teal, 75))
+
+    table.cell(t, 0, 29, "Expectancy / trade", text_color = color.white, bgcolor = color.new(color.teal, 75))
+    table.cell(t, 1, 29, na(expectancyUSDT) ? "na" : str.tostring(expectancyUSDT, "#.##"), text_color = color.white, bgcolor = color.new(color.teal, 75))
+
+    table.cell(t, 0, 30, "Qty / Fee%", text_color = color.white, bgcolor = color.new(color.gray, 80))
+    table.cell(t, 1, 30, str.tostring(positionQtyLINK, "#.####") + " / " + (feesEnabled ? str.tostring(feePerSidePct, "#.###") : "OFF"), text_color = color.white, bgcolor = color.new(color.gray, 80))
+
+// =========================
+// Live webhook payload
+// =========================
+string rtWebhookPayload = ""
+bool rtWebhookPayloadReady = false
+if rtMoveStopReady
+    array<string> rtEvents = array.new_string()
+    string rtEvent = f_build_event("move_stop", posId, posDir, posFill, rtMoveStopPrice, posTP, na(posEntryBar) ? bar_index : posEntryBar, 1, "be_activated")
+    array.push(rtEvents, rtEvent)
+    webhookSeq += 1
+    rtWebhookPayload := f_flush_events(rtEvents, posActive, posDir, posId, posFill, rtMoveStopPrice, posTP, true, livePendingCount, shadowPendingCount, pendingLongs, pendingShorts, webhookSeq)
+    rtWebhookPayloadReady := str.length(rtWebhookPayload) > 0
+
+string webhookPayload = ""
+bool webhookBatchReady = emitAlertPayloads and barstate.isconfirmed and tfOk and array.size(liveEvents) > 0
+bool webhookPayloadReady = false
+if webhookBatchReady
+    webhookSeq += 1
+    webhookPayload := f_flush_events(liveEvents, posActive, posDir, posId, posFill, posStop, posTP, posMovedToBE, livePendingCount, shadowPendingCount, pendingLongs, pendingShorts, webhookSeq)
+    webhookPayloadReady := str.length(webhookPayload) > 0
+
+// Fallback alert trigger so the Create Alert dialog always exposes at least one
+// explicit integration condition even if TradingView's UI fails to show
+// "Any alert() function call" for this script.
+alertcondition(webhookPayloadReady, "Webhook batch ready", "Fallback trigger for integration tests. Prefer 'Any alert() function call' if TradingView exposes it.")
+
+if rtWebhookPayloadReady
+    alertBatchCount += 1
+    alertEventCount += 1
+    lastAlertBar := bar_index
+    lastAlertEventCount := 1
+    alert(rtWebhookPayload, alert.freq_all)
+
+if webhookPayloadReady
+    alertBatchCount += 1
+    alertEventCount += array.size(liveEvents)
+    lastAlertBar := bar_index
+    lastAlertEventCount := array.size(liveEvents)
+    alert(webhookPayload, alert.freq_once_per_bar_close)
+
+

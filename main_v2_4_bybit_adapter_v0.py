@@ -73,7 +73,7 @@ SEEN_BATCH_IDS: List[str] = []
 SEEN_BATCH_LOOKUP = set()
 
 
-app = FastAPI(title="TV Receiver + Bybit Demo Adapter LINK v0")
+app = FastAPI(title=os.getenv("APP_TITLE", "TV Receiver + Bybit Adapter v2.4"))
 
 
 def utc_now_iso() -> str:
@@ -450,7 +450,7 @@ class AdapterConfig:
     api_secret: str = ""
     recv_window: int = 5000
     timeout: int = 10
-    journal_path: str = "/tmp/bybit_adapter_link_v0.json"
+    journal_path: str = "/tmp/bybit_adapter_v0.json"
     tp_sl_mode_on_entry: str = "Full"  # Full for Market TP/SL, Partial for limit TP/SL
     trigger_by: str = "LastPrice"
 
@@ -474,7 +474,7 @@ class AdapterConfig:
             api_secret=os.getenv("BYBIT_API_SECRET", ""),
             recv_window=int(os.getenv("BYBIT_RECV_WINDOW", "5000")),
             timeout=int(os.getenv("BYBIT_TIMEOUT", "10")),
-            journal_path=os.getenv("ADAPTER_JOURNAL_PATH", "/tmp/bybit_adapter_link_v0.json"),
+            journal_path=os.getenv("ADAPTER_JOURNAL_PATH", "/tmp/bybit_adapter_v0.json"),
             tp_sl_mode_on_entry=os.getenv("BYBIT_TPSL_MODE_ON_ENTRY", "Full").strip() or "Full",
             trigger_by=os.getenv("BYBIT_TRIGGER_BY", "LastPrice").strip() or "LastPrice",
         )
@@ -933,7 +933,16 @@ class BybitDemoAdapterV0:
         )
 
     def _build_cancel_command(self, batch: TVBatch, event: TVEvent, event_key: str) -> Optional[ExecutionCommand]:
-        if event.stage != "live" or not event.id:
+        # Normal case: live pending cancellation should cancel the exchange order.
+        # Special case: when another pending order fills, Pine intentionally moves the
+        # opposite order into shadow bookkeeping with reason=filled_other_order_hold_shadow.
+        # That event still represents a formerly-live exchange order and must be cancelled
+        # on Bybit before the shadow copy is kept for Pine's virtual lifecycle.
+        should_cancel_on_exchange = (
+            event.stage == "live"
+            or event.reason == "filled_other_order_hold_shadow"
+        )
+        if not should_cancel_on_exchange or not event.id:
             return None
         symbol = self._normalized_symbol(batch.symbol)
         params = {
@@ -1377,7 +1386,7 @@ def route_event(event: TVEvent) -> None:
 def root() -> Dict[str, Any]:
     return {
         "status": "ok",
-        "service": "tv_receiver_bybit_adapter_link_v0",
+        "service": os.getenv("SERVICE_NAME", "tv_receiver_bybit_adapter_v2_4"),
         "time": utc_now_iso(),
         "execution_mode": ADAPTER.config.mode,
     }
